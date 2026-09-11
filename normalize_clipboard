@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+
+"""
+A beautiful TUI script to normalize clipboard text by replacing specific Unicode characters
+(including a comprehensive set of homoglyphs/confusables) with their more
+common ASCII or standard equivalents.
+
+It automatically downloads and caches the official Unicode confusables data file,
+displays changes in a beautiful table, and asks for user confirmation before modifying the
+clipboard.
+"""
+
+import os
+import re
+import sys
+import time
+from typing import List, Tuple
+
+# --- Dependency Check ---
+try:
+    import pyperclip
+    import requests
+    from rich import box
+    from rich.align import Align
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from rich.prompt import Confirm
+    from rich.table import Table
+except ImportError:
+    print("Error: Required libraries not found.", file=sys.stderr)
+    print("Please install them by running:", file=sys.stderr)
+    print("pip install requests pyperclip rich", file=sys.stderr)
+    sys.exit(1)
+
+# --- Configuration ---
+CONFUSABLES_URL = "https://raw.githubusercontent.com/unicode-org/icu/main/icu4c/source/data/unidata/confusables.txt"
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "normalize-clipboard")
+CACHE_FILE = os.path.join(CACHE_DIR, "confusables.txt")
+CACHE_EXPIRY_DAYS = 30
+
+console = Console()
+
+
+def print_header():
+    """Display a beautiful header for the application."""
+    title = "✨ Clipboard Normalizer ✨"
+    subtitle = "Transform Unicode confusables into clean ASCII text"
+
+    header_content = (
+        f"[bold magenta]{title}[/bold magenta]\n[italic cyan]{subtitle}[/italic cyan]"
+    )
+
+    console.print(
+        Panel(
+            Align.center(header_content),
+            box=box.DOUBLE,
+            style="bright_blue",
+            padding=(1, 2),
+        )
+    )
+    console.print()
+
+
+def get_confusables_datafile():
+    """
+    Ensures the confusables.txt file is downloaded and cached locally.
+    Returns the path to the cached file.
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    needs_download = False
+
+    if not os.path.exists(CACHE_FILE):
+        needs_download = True
+    else:
+        file_age_seconds = time.time() - os.path.getmtime(CACHE_FILE)
+        if file_age_seconds > CACHE_EXPIRY_DAYS * 24 * 60 * 60:
+            needs_download = True
+
+    if needs_download:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            if not os.path.exists(CACHE_FILE):
+                task = progress.add_task(
+                    "📥 Downloading Unicode confusables data...", total=None
+                )
+            else:
+                task = progress.add_task(
+                    f"🔄 Updating cached data (older than {CACHE_EXPIRY_DAYS} days)...",
+                    total=None,
+                )
+
+            try:
+                response = requests.get(CONFUSABLES_URL, timeout=15)
+                response.raise_for_status()
+                with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                    f.write(response.text)
+                progress.update(task, description="✅ Download complete!")
+                time.sleep(0.5)  # Brief pause to show completion
+            except requests.RequestException as e:
+                progress.update(task, description=f"❌ Download failed: {e}")
+                time.sleep(1)
+                if not os.path.exists(CACHE_FILE):
+                    console.print(
+                        Panel(
+                            f"[red]Failed to download confusables data: {e}[/red]",
+                            title="❌ Error",
+                            style="red",
+                        )
+                    )
+                    sys.exit(1)
+                else:
+                    console.print(
+                        Panel(
+                            "[yellow]Using stale cached data as fallback[/yellow]",
+                            title="⚠️  Warning",
+                            style="yellow",
+                        )
+                    )
+
+    return CACHE_FILE
+
+
+def build_rules_map():
+    """
+    Builds a dictionary of {source_char: (replacement, description)} from
+    manual rules and the cached Unicode data file.
+    """
+    rules = {}
+
+    # --- Stage 1: Manual, High-Priority Rules ---
+    manual_rules = [
+        # Spaces & Zero-Width
+        ("00A0", " ", "No-Break Space"),
+        ("2000", " ", "En Quad"),
+        ("2001", " ", "Em Quad"),
+        ("2002", " ", "En Space"),
+        ("2003", " ", "Em Space"),
+        ("2009", " ", "Thin Space"),
+        ("202F", " ", "Narrow NBSP"),
+        ("3000", " ", "Ideographic Space"),
+        ("200B", "", "Zero-Width Space"),
+        ("200C", "", "Zero-Width Non-Joiner"),
+        ("FEFF", "", "BOM/Zero-Width NBSP"),
+        # Quotes
+        ("2018", "'", "Left Single Quote"),
+        ("2019", "'", "Right Single Quote"),
+        ("201C", '"', "Left Double Quote"),
+        ("201D", '"', "Right Double Quote"),
+        # Dashes & Ellipses
+        ("2011", "-", "Non-Break Hyphen"),
+        ("2013", "-", "En Dash"),
+        ("2014", "-", "Em Dash"),
+        ("2212", "-", "Minus Sign"),
+        ("2026", "...", "Ellipsis"),
+        # Separators
+        ("2028", "\n", "Line Separator"),
+        ("2029", "\n", "Paragraph Separator"),
+        # Bullets
+        ("00B7", "-", "Middle Dot"),
+        ("2022", "-", "Bullet"),
+    ]
+
+    for hex_code, replacement, desc in manual_rules:
+        char = chr(int(hex_code, 16))
+        rules[char] = (replacement, f"{desc} (U+{hex_code})")
+
+    # --- Stage 2: Rules from Unicode Confusables Data ---
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task(
+            "🔄 Processing Unicode confusables data...", total=None
+        )
+
+        confusables_file = get_confusables_datafile()
+        with open(confusables_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("#") or not line.strip():
+                    continue
+
+                try:
+                    parts = [p.strip() for p in line.split(";")]
+                    source_hex = parts[0]
+                    target_hex_list = parts[1].split()
+
+                    # Skip if source is standard ASCII or already in our manual list
+                    source_char = chr(int(source_hex, 16))
+                    if int(source_hex, 16) < 128 or source_char in rules:
+                        continue
+
+                    # Build target string from one or more hex codes
+                    target_str = "".join([chr(int(h, 16)) for h in target_hex_list])
+
+                    # We only want rules that simplify to ASCII or a known decomposition
+                    is_complex_target = any(ord(c) > 127 for c in target_str)
+                    if len(target_str) == 1 and is_complex_target:
+                        continue
+
+                    # Get description from the comment
+                    comment_match = re.search(r"#\s*(.+)", line)
+                    description = (
+                        comment_match.group(1).strip()
+                        if comment_match
+                        else "Confusable"
+                    )
+
+                    rules[source_char] = (target_str, description)
+
+                except (ValueError, IndexError):
+                    # Ignore malformed lines
+                    continue
+
+        progress.update(task, description="✅ Unicode data processing complete!")
+        time.sleep(0.3)
+
+    return rules
+
+
+def normalize_text(text, rules_map):
+    """Applies all normalization rules to the given text."""
+    for source_char, (replacement, _) in rules_map.items():
+        text = text.replace(source_char, replacement)
+    return text
+
+
+def format_replacement_display(replacement: str) -> str:
+    """Format replacement text for display in the table."""
+    if not replacement:
+        return "[dim red]removed[/dim red]"
+    elif replacement == " ":
+        return "[cyan]space[/cyan]"
+    elif replacement == "\n":
+        return "[cyan]newline[/cyan]"
+    elif replacement == "\t":
+        return "[cyan]tab[/cyan]"
+    else:
+        return f"[green]'{replacement}'[/green]"
+
+
+def display_changes_table(changes_found: List[Tuple[str, str, str]]):
+    """Display detected changes in a beautiful table."""
+    if not changes_found:
+        console.print(
+            Panel(
+                "[yellow]Content differs, likely due to subtle whitespace or line-ending modifications.[/yellow]",
+                title="📝 Changes Detected",
+                style="yellow",
+            )
+        )
+        return
+
+    table = Table(
+        title="📋 Detected Character Changes",
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold cyan",
+    )
+
+    table.add_column("Original Character", style="red", no_wrap=True)
+    table.add_column("Description", style="white")
+    table.add_column("Replacement", style="green", no_wrap=True)
+
+    # Sort changes by description for better organization
+    sorted_changes = sorted(set(changes_found), key=lambda x: x[1])
+
+    for original_char, description, replacement in sorted_changes:
+        # Show the actual character if printable, otherwise show Unicode code point
+        if original_char.isprintable() and original_char.strip():
+            char_display = f"'{original_char}'"
+        else:
+            char_display = f"U+{ord(original_char):04X}"
+
+        table.add_row(
+            char_display, description, format_replacement_display(replacement)
+        )
+
+    console.print(table)
+
+
+def main():
+    """Main execution function."""
+    try:
+        print_header()
+
+        # Check clipboard content
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("📋 Reading clipboard content...", total=None)
+            time.sleep(0.2)  # Brief delay for visual feedback
+
+            original_text = pyperclip.paste()
+            if not original_text:
+                progress.update(task, description="📋 Clipboard is empty")
+                time.sleep(0.5)
+                console.print(
+                    Panel(
+                        "[yellow]Clipboard is empty. Copy some text and try again.[/yellow]",
+                        title="📋 No Content",
+                        style="yellow",
+                    )
+                )
+                return
+
+            progress.update(task, description="✅ Clipboard content loaded")
+            time.sleep(0.3)
+
+        # Build rules map
+        rules_map = build_rules_map()
+
+        # Normalize line endings to LF for consistent comparison
+        original_text = original_text.replace("\r\n", "\n").replace("\r", "\n")
+        normalized_text = normalize_text(original_text, rules_map)
+
+        if original_text == normalized_text:
+            console.print(
+                Panel(
+                    "[green]✅ Clipboard content is already normalized![/green]\n[dim]No targeted characters found.[/dim]",
+                    title="🎉 All Good",
+                    style="green",
+                )
+            )
+            return
+
+        # --- Find and Display Changes ---
+        changes_found = []
+        for source_char, (replacement, description) in rules_map.items():
+            if source_char in original_text:
+                # Check if the replacement actually results in a change
+                if original_text.replace(source_char, replacement) != original_text:
+                    changes_found.append((source_char, description, replacement))
+
+        console.print()
+        display_changes_table(changes_found)
+
+        # Show content length info if no specific changes found
+        if not changes_found:
+            console.print(
+                f"\n[dim]Original length: {len(original_text)}, Normalized length: {len(normalized_text)}[/dim]"
+            )
+
+        console.print()
+
+        # Confirmation prompt
+        if Confirm.ask("🚀 Apply these changes to the clipboard?", default=False):
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console,
+                transient=True,
+            ) as progress:
+                task = progress.add_task("📝 Updating clipboard...", total=None)
+                pyperclip.copy(normalized_text)
+                time.sleep(0.3)
+                progress.update(task, description="✅ Clipboard updated!")
+                time.sleep(0.3)
+
+            console.print(
+                Panel(
+                    "[green]🎉 Clipboard has been successfully normalized![/green]",
+                    title="✅ Success",
+                    style="green",
+                )
+            )
+        else:
+            console.print(
+                Panel(
+                    "[yellow]Normalization cancelled by user.[/yellow]",
+                    title="🚫 Cancelled",
+                    style="yellow",
+                )
+            )
+
+    except KeyboardInterrupt:
+        console.print(
+            Panel(
+                "[yellow]Operation cancelled by user.[/yellow]",
+                title="🚫 Interrupted",
+                style="yellow",
+            )
+        )
+        sys.exit(1)
+    except Exception as e:
+        console.print(
+            Panel(
+                f"[red]An unexpected error occurred: {e}[/red]",
+                title="❌ Error",
+                style="red",
+            )
+        )
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

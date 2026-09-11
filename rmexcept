@@ -1,0 +1,52 @@
+#!/bin/bash
+
+# Check if the correct number of arguments are provided
+if [ "$#" -lt 2 ]; then
+    echo "Usage: rmexcept <directory> <file_to_keep> [...<additional_file_to_keep>]"
+    exit 1
+fi
+
+directory="$1"
+shift  # Remove the directory argument
+
+# Check if the provided directory exists
+if [ ! -d "$directory" ]; then
+    echo "Error: Directory '$directory' does not exist."
+    exit 1
+fi
+
+# Confirm the operation with the user
+echo "This will remove all files and directories in '$directory' except:"
+for file_to_keep in "$@"; do
+    echo "  - $file_to_keep"
+done
+read -r -p "Are you sure you want to proceed? [y/N] " response
+
+if [[ ! "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+    echo "Operation canceled."
+    exit 0
+fi
+
+# Change to the provided directory
+cd "$directory" || exit
+
+# Loop through the contents of the directory
+for file in *; do
+    # Initialize a flag to indicate if the file should be kept
+    keep_file=false
+
+    # Check if the file is in the list of files to keep
+    for file_to_keep in "$@"; do
+        if [ "$file" = "$file_to_keep" ]; then
+            keep_file=true
+            break
+        fi
+    done
+
+    # If the file should not be kept and it's not the script itself, remove it
+    if ! $keep_file && [ "$file" != "${0##*/}" ]; then
+        rm -rf "$file"
+    fi
+done
+
+echo "Operation completed."

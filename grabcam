@@ -1,0 +1,55 @@
+#!/bin/sh
+# grabcam — snapshot or short video from a remote V4L2 webcam over SSH
+# usage:
+#   grabcam [host] [outfile] [device] [seconds]
+# defaults:
+#   host=home
+#   outfile=pic-YYYYmmdd-HHMMSS.jpg  (if seconds=0)
+#           vid-YYYYmmdd-HHMMSS.mkv  (if seconds>0)
+#   device=/dev/video0
+#   seconds=0 (snapshot)
+
+set -eu
+
+HOST="${1:-home}"
+SECONDS="${4:-0}"
+DEV="${3:-/dev/video0}"
+
+# pick output based on mode
+if [ "$SECONDS" -gt 0 ]; then
+    OUT="${2:-vid-$(date +%Y%m%d-%H%M%S).mkv}"
+else
+    OUT="${2:-pic-$(date +%Y%m%d-%H%M%S).jpg}"
+fi
+
+command -v ssh >/dev/null || { echo "ssh not found" >&2; exit 127; }
+
+if [ "$SECONDS" -gt 0 ]; then
+    # video capture
+    EXT="${OUT##*.}"
+    # common video opts: fast encode, broad compatibility
+    VOPTS="-vcodec libx264 -preset ultrafast -t $SECONDS -pix_fmt yuv420p"
+
+    case "$EXT" in
+        mp4|MP4)
+            # MP4 over pipe: must be fragmented/streamable
+            MUX="-f mp4 -movflags +frag_keyframe+empty_moov"
+            ;;
+        *)
+            # anything else → matroska works great over pipes
+            MUX="-f matroska"
+            ;;
+    esac
+
+    ssh -o BatchMode=yes -o ConnectTimeout=5 "$HOST" \
+      "ffmpeg -hide_banner -loglevel error -nostdin \
+       -f v4l2 -i $DEV $VOPTS $MUX -" >"$OUT"
+else
+    # single JPEG frame
+    ssh -o BatchMode=yes -o ConnectTimeout=5 "$HOST" \
+      "ffmpeg -hide_banner -loglevel error -nostdin \
+       -f v4l2 -i $DEV -frames:v 1 -f image2pipe -vcodec mjpeg -" >"$OUT"
+fi
+
+echo "Saved $OUT"
+

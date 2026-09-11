@@ -1,0 +1,49 @@
+#!/usr/bin/env ruby
+
+DICTIONARY = {
+  "a" => "Ancona",
+  "b" => "Bologna",
+  "c" => "Cagliari",
+  "d" => "Domodossola",
+  "e" => "Empoli",
+  "f" => "Firenze",
+  "g" => "Genova",
+  "h" => "Hotel",
+  "i" => "Imola",
+  "j" => "Jesolo",
+  "k" => "Kilometro",
+  "l" => "Livorno",
+  "m" => "Milano",
+  "n" => "Napoli",
+  "o" => "Otranto",
+  "p" => "Palermo",
+  "q" => "Quadro",
+  "r" => "Roma",
+  "s" => "Siena",
+  "t" => "Torino",
+  "u" => "Udine",
+  "v" => "Venezia",
+  "w" => "Washington",  # non esiste equivalente comune nel codice italiano
+  "x" => "Xilofono",   # usato come convenzione
+  "y" => "Yogurt",
+  "z" => "Zara",
+  "1" => "Uno",
+  "2" => "Due",
+  "3" => "Tre",
+  "4" => "Quattro",
+  "5" => "Cinque",
+  "6" => "Sei",
+  "7" => "Sette",
+  "8" => "Otto",
+  "9" => "Nove",
+  "0" => "Zero"
+}
+
+ARGV.join(' ').split(' ').each do |word|
+  letters = word.downcase.each_char.map do |char|
+    DICTIONARY.fetch char, char
+  end
+
+  puts letters.join(' ')
+end
+

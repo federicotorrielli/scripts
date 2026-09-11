@@ -1,0 +1,69 @@
+#!/bin/sh
+set -eu
+
+FONT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/fonts"
+
+die() {
+    printf '%s\n' "$1" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+Usage: ${0##*/} <font-file|directory>...
+
+Install font files to $FONT_DIR.
+Supports: .ttf, .otf, .woff, .woff2
+
+Examples:
+    ${0##*/} myfont.ttf
+    ${0##*/} ./fonts/
+    ${0##*/} font1.ttf font2.otf ./more-fonts/
+EOF
+    exit 0
+}
+
+is_font() {
+    case "${1##*.}" in
+        ttf|otf|woff|woff2|TTF|OTF|WOFF|WOFF2) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+install_font() {
+    [ -f "$1" ] || die "Not a file: $1"
+    is_font "$1" || die "Not a font file: $1"
+    
+    cp -v "$1" "$FONT_DIR/"
+}
+
+install_dir() {
+    [ -d "$1" ] || die "Not a directory: $1"
+    
+    found=0
+    for f in "$1"/*; do
+        [ -f "$f" ] && is_font "$f" && { install_font "$f"; found=1; }
+    done
+    
+    [ "$found" -eq 1 ] || printf 'No fonts found in: %s\n' "$1" >&2
+}
+
+[ $# -eq 0 ] && usage
+[ "$1" = "-h" ] || [ "$1" = "--help" ] && usage
+
+mkdir -p "$FONT_DIR"
+
+for arg in "$@"; do
+    if [ -d "$arg" ]; then
+        install_dir "$arg"
+    elif [ -f "$arg" ]; then
+        install_font "$arg"
+    else
+        die "Not found: $arg"
+    fi
+done
+
+printf '\nRebuilding font cache...\n'
+fc-cache -f
+
+printf 'Done. Installed fonts are in: %s\n' "$FONT_DIR"

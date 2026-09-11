@@ -1,0 +1,94 @@
+#!/bin/sh
+# files2clipboard - copy file contents to clipboard
+# Usage: files2clipboard [-h] [-m] [file ...]
+
+set -e
+
+die() {
+	printf 'error: %s\n' "$1" >&2
+	exit 1
+}
+
+usage() {
+	cat <<-EOF
+	Usage: files2clipboard [-h] [-m] [file ...]
+	
+	Copy file contents to clipboard.
+	
+	Options:
+	  -h    Show this help message
+	  -m    Include markdown headers/footers (default: plain text)
+	
+	Arguments:
+	  file  Files or directories to process
+	        Directories are processed recursively
+	
+	Examples:
+	  files2clipboard file.txt
+	  files2clipboard -m src/*.c
+	  files2clipboard -m myproject/
+	
+	EOF
+	exit 0
+}
+
+# detect clipboard utility
+if command -v wl-copy >/dev/null 2>&1; then
+	clip() { wl-copy; }
+elif command -v xclip >/dev/null 2>&1; then
+	clip() { xclip -selection clipboard; }
+elif command -v pbcopy >/dev/null 2>&1; then
+	clip() { pbcopy; }
+else
+	die 'no clipboard utility found (install wl-clipboard, xclip or pbcopy)'
+fi
+
+# parse options
+markdown=0
+while getopts 'hm' opt; do
+	case "$opt" in
+		h) usage ;;
+		m) markdown=1 ;;
+		*) die 'invalid option (use -h for help)' ;;
+	esac
+done
+shift $((OPTIND - 1))
+
+# check arguments
+[ $# -eq 0 ] && die 'no files specified (use -h for help)'
+
+# process files
+tmpfile=$(mktemp)
+trap 'rm -f "$tmpfile"' EXIT INT TERM
+
+process_file() {
+	[ -f "$1" ] || return
+	if [ "$markdown" -eq 1 ]; then
+		printf '# file: %s\n```\n' "${1##*/}"
+		cat "$1"
+		printf '\n```\n'
+	else
+		cat "$1"
+	fi
+}
+
+for path in "$@"; do
+	if [ -d "$path" ]; then
+		find "$path" -type f | while read -r file; do
+			process_file "$file"
+		done
+	elif [ -f "$path" ]; then
+		process_file "$path"
+	else
+		printf 'warning: skipping %s (not a file or directory)\n' "$path" >&2
+	fi
+done > "$tmpfile"
+
+# check if content exists
+[ -s "$tmpfile" ] || die 'no valid files found'
+
+# copy to clipboard
+clip < "$tmpfile"
+printf 'copied to clipboard\n'
+
+
