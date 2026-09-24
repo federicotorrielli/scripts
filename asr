@@ -1,0 +1,151 @@
+#!/bin/sh
+# asr - transcribe an audio file or URL (nemotron 3.5 asr or qwen3 asr)
+# deps: uv (https://docs.astral.sh/uv/) -- python deps resolved on the fly
+# usage: asr [-l lang] [-m model] [-o out.txt] [-v] <file|url>
+set -eu
+
+MODEL="${ASR_MODEL:-nemotron}"
+# transformers spec; default = latest PyPI release
+TFS="${ASR_TRANSFORMERS:-transformers}"
+LANG_="${ASR_LANG:-en-US}"        # locale ("en-US", "de-DE", bare "de") or "auto"
+CHUNK="${ASR_CHUNK:-120}"         # decode window in seconds (memory ceiling)
+OUT=""                            # default: stdout
+VERBOSE=0
+REFRESH=""                        # -U sets uv flags to re-resolve transformers
+
+log() { [ "$VERBOSE" -eq 1 ] && printf '%s asr: %s\n' "$(date +%T)" "$*" >&2 || :; }
+die() { printf 'asr: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+	cat >&2 <<EOF
+usage: asr [-l lang] [-c secs] [-m model] [-o file] [-v] <file|url>
+  -l lang   language locale or "auto" (default: $LANG_)
+  -c secs   decode window in seconds; lower it if you OOM (default: $CHUNK)
+  -m model  nemotron | qwen | qwen-0.6b | any hf id (default: $MODEL)
+  -o file   write transcript to file instead of stdout
+  -U        check pypi and upgrade transformers to the latest release
+  -v        verbose logging to stderr (includes transformers version)
+env: ASR_LANG, ASR_CHUNK, ASR_MODEL, ASR_TRANSFORMERS override defaults
+EOF
+	exit 1
+}
+
+while getopts l:c:m:o:Uvh opt; do
+	case $opt in
+	l) LANG_=$OPTARG ;;
+	c) CHUNK=$OPTARG ;;
+	m) MODEL=$OPTARG ;;
+	o) OUT=$OPTARG ;;
+	U) REFRESH="--upgrade-package transformers --refresh-package transformers" ;;
+	v) VERBOSE=1 ;;
+	*) usage ;;
+	esac
+done
+shift $((OPTIND - 1))
+[ $# -eq 1 ] || usage
+SRC=$1
+
+# short names for the known-good checkpoints; anything else is a raw hf id
+case $MODEL in
+nemotron)  MODEL=nvidia/nemotron-3.5-asr-streaming-0.6b ;;
+qwen)      MODEL=Qwen/Qwen3-ASR-1.7B-hf ;;
+qwen-0.6b) MODEL=Qwen/Qwen3-ASR-0.6B-hf ;;
+esac
+
+# accept a local file or an http(s) url; load_audio handles both
+case $SRC in
+http://*|https://*) log "input: url $SRC" ;;
+*) [ -r "$SRC" ] || die "cannot read file: $SRC"
+   SRC=$(realpath "$SRC"); log "input: file $SRC" ;;
+esac
+
+command -v uv >/dev/null || die "uv not found (https://docs.astral.sh/uv/)"
+
+log "model: $MODEL  lang: $LANG_"
+[ "$TFS" != "transformers" ] && log "transformers spec: $TFS"
+
+# uv resolves an ephemeral env (cached after first run); script comes in on stdin
+# shellcheck disable=SC2086  # $REFRESH is intentionally word-split
+# --managed-python: uv's own interpreter, so host sitecustomize/dist-packages
+# (colab) can never leak in; torch* pulled as one matched family
+TXT=$(PYTHONPATH= PYTHONNOUSERSITE=1 uv run --quiet --managed-python $REFRESH \
+	--with "$TFS" \
+	--with torch --with torchvision --with torchaudio --with torchcodec \
+	--with accelerate --with soundfile --with librosa \
+	- "$SRC" "$LANG_" "$MODEL" "$CHUNK" "$VERBOSE" <<'EOF'
+import sys, warnings
+src, lang, model_id = sys.argv[1], sys.argv[2], sys.argv[3]
+chunk_s, verbose = int(sys.argv[4]), sys.argv[5] == "1"
+if not verbose:
+    warnings.filterwarnings("ignore")
+
+def log(msg):
+    if verbose:
+        print(f"asr: {msg}", file=sys.stderr)
+
+import torch
+import transformers
+from transformers import AutoProcessor
+from transformers.audio_utils import load_audio
+
+log(f"transformers {transformers.__version__}, torch {torch.__version__}")
+dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+log(f"loading processor + model ({dtype})")
+processor = AutoProcessor.from_pretrained(model_id)
+
+is_qwen = "qwen3-asr" in model_id.lower()
+if is_qwen:
+    from transformers import AutoModelForMultimodalLM as AutoModel
+    # qwen takes full names or bare iso codes; None = auto-detect
+    qlang = None if lang == "auto" else lang.split("-")[0]
+else:
+    from transformers import AutoModelForRNNT as AutoModel
+model = AutoModel.from_pretrained(model_id, device_map="auto", dtype=dtype)
+
+sr = processor.feature_extractor.sampling_rate
+log(f"loading audio at {sr} Hz")
+audio = load_audio(src, sampling_rate=sr)
+dur = audio.shape[0] / sr
+log(f"audio: {dur:.1f}s, chunk: {chunk_s}s")
+
+def transcribe_qwen(chunk, first):
+    inputs = processor.apply_transcription_request(audio=chunk, language=qlang)
+    inputs = inputs.to(model.device, model.dtype)
+    out = model.generate(**inputs, max_new_tokens=max(256, chunk_s * 12), do_sample=False)
+    gen = out[:, inputs["input_ids"].shape[1]:]
+    if first and qlang is None:
+        parsed = processor.decode(gen, return_format="parsed")[0]
+        log(f"detected language: {parsed.get('language') or 'unknown'}")
+    return processor.decode(gen, return_format="transcription_only")[0].strip()
+
+def transcribe_nemotron(chunk, first):
+    inputs = processor(chunk, sampling_rate=sr, language=lang)
+    inputs.to(model.device, dtype=model.dtype)
+    out = model.generate(**inputs, return_dict_in_generate=True)
+    # decode returns one string per batch item, i.e. a 1-element list here
+    if first and lang == "auto":
+        import re
+        tagged = processor.decode(out.sequences, skip_special_tokens=False)[0]
+        m = re.search(r"<[a-z]{2}-[A-Z]{2}>", tagged)
+        log(f"detected language: {m.group(0) if m else 'no tag emitted'}")
+    return processor.decode(out.sequences, skip_special_tokens=True)[0].strip()
+
+transcribe = transcribe_qwen if is_qwen else transcribe_nemotron
+
+# activation memory scales with clip length, so decode in fixed windows
+pieces = []
+step = chunk_s * sr
+for i, start in enumerate(range(0, audio.shape[0], step)):
+    pieces.append(transcribe(audio[start:start + step], first=(i == 0)))
+    log(f"chunk {i}: {min((start + step) / sr, dur):.0f}/{dur:.0f}s done")
+
+print(" ".join(p for p in pieces if p))
+EOF
+) || die "transcription failed"
+
+if [ -n "$OUT" ]; then
+	printf '%s\n' "$TXT" > "$OUT"
+	log "wrote $OUT"
+else
+	printf '%s\n' "$TXT"
+fi
